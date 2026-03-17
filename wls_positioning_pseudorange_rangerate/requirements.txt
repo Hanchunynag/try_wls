@@ -1,2 +1,6 @@
 numpy>=2.0
 pymap3d>=3.0
+matplotlib>=3.8
+orekit-jpype>=13.1
+jpype1>=1.5
+requests>=2.31

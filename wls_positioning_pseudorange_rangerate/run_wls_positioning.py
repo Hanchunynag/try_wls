@@ -4,17 +4,28 @@ import json
 import math
 import re
 import sys
+import zipfile
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import jpype
+import matplotlib
 import numpy as np
+import orekit_jpype
 import pymap3d as pm
+import requests
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STEP1_INDEX_FILE = PROJECT_ROOT / "step1_data_generation" / "output" / "passes_index.json"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+OREKIT_DATA_ZIP = PROJECT_ROOT / "step1_data_generation" / "orekit-data.zip"
+OREKIT_DATA_URL = "https://gitlab.orekit.org/orekit/orekit-data/-/archive/main/orekit-data-main.zip"
 
 
 @dataclass(frozen=True)
@@ -72,6 +83,16 @@ class MonteCarloConfig:
 
 
 @dataclass(frozen=True)
+class AtmosphereConfig:
+    enable_klobuchar: bool = True
+    enable_hopfield: bool = True
+    signal_frequency_hz: float = 1_575_420_000.0
+    klobuchar_nav_file: str = ""
+    klobuchar_alpha: tuple[float, float, float, float] = (2.4214e-08, 1.4901e-08, -1.1921e-07, 0.0)
+    klobuchar_beta: tuple[float, float, float, float] = (1.1674e05, -2.2938e05, -1.3107e05, 1.0486e06)
+
+
+@dataclass(frozen=True)
 class RunConfig:
     single_trial_only: bool = False
     single_trial_seed: int = 20260315
@@ -85,6 +106,7 @@ TRUTH = TruthConfig()
 INIT = InitConfig()
 WLS = WlsConfig()
 MC = MonteCarloConfig()
+ATM = AtmosphereConfig()
 RUN = RunConfig()
 NOISE_PROFILES = ("orbcomm_like", "optimistic_pnt")
 
@@ -114,6 +136,203 @@ def rms(values: np.ndarray) -> float:
 def receiver_ecef(receiver: ReceiverConfig) -> np.ndarray:
     x, y, z = pm.geodetic2ecef(receiver.latitude_deg, receiver.longitude_deg, receiver.altitude_m, deg=True)
     return np.array([x, y, z], dtype=float)
+
+
+def download_file(url: str, destination: Path, max_retries: int = 3) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for _ in range(max_retries):
+        try:
+            with requests.get(url, stream=True, timeout=60) as response:
+                response.raise_for_status()
+                with destination.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+            with zipfile.ZipFile(destination) as archive:
+                if archive.testzip() is not None:
+                    raise zipfile.BadZipFile("Corrupted orekit-data.zip entry detected.")
+            return
+        except Exception as exc:  # pragma: no cover - network retry path
+            last_error = exc
+            if destination.exists():
+                destination.unlink()
+    raise RuntimeError(f"Failed to download Orekit data from {url}") from last_error
+
+
+def ensure_orekit_ready(orekit_data_zip: Path) -> None:
+    if not orekit_data_zip.exists():
+        download_file(OREKIT_DATA_URL, orekit_data_zip)
+    else:
+        try:
+            with zipfile.ZipFile(orekit_data_zip) as archive:
+                if archive.testzip() is not None:
+                    raise zipfile.BadZipFile("Corrupted archive entry detected.")
+        except zipfile.BadZipFile:
+            download_file(OREKIT_DATA_URL, orekit_data_zip)
+
+    if not jpype.isJVMStarted():
+        orekit_jpype.initVM()
+
+    from orekit_jpype.pyhelpers import setup_orekit_curdir
+
+    setup_orekit_curdir(str(orekit_data_zip))
+
+
+def resolve_klobuchar_coefficients() -> tuple[list[float], list[float], str]:
+    if ATM.klobuchar_nav_file:
+        nav_path = Path(ATM.klobuchar_nav_file)
+        if not nav_path.is_absolute():
+            nav_path = PROJECT_ROOT / nav_path
+        if not nav_path.exists():
+            raise FileNotFoundError(f"Klobuchar navigation file not found: {nav_path}")
+
+        from java.io import BufferedInputStream, FileInputStream
+        from org.orekit.models.earth.ionosphere import KlobucharIonoCoefficientsLoader
+
+        loader = KlobucharIonoCoefficientsLoader()
+        stream = BufferedInputStream(FileInputStream(str(nav_path)))
+        try:
+            loader.loadData(stream, nav_path.name)
+        finally:
+            stream.close()
+        return (
+            [float(value) for value in loader.getAlpha()],
+            [float(value) for value in loader.getBeta()],
+            str(nav_path.resolve()),
+        )
+
+    return list(ATM.klobuchar_alpha), list(ATM.klobuchar_beta), "config"
+
+
+def build_atmosphere_context(receiver: ReceiverConfig) -> dict[str, Any]:
+    if not (ATM.enable_klobuchar or ATM.enable_hopfield):
+        return {}
+
+    ensure_orekit_ready(OREKIT_DATA_ZIP)
+
+    from orekit_jpype.pyhelpers import datetime_to_absolutedate
+    from org.orekit.bodies import GeodeticPoint
+    from org.orekit.models.earth.ionosphere import KlobucharIonoModel
+    from org.orekit.models.earth.troposphere import ModifiedHopfieldModel, TroposphericModelUtils
+
+    klobuchar_alpha, klobuchar_beta, klobuchar_source = resolve_klobuchar_coefficients()
+    return {
+        "receiver_gp": GeodeticPoint(
+            math.radians(receiver.latitude_deg),
+            math.radians(receiver.longitude_deg),
+            receiver.altitude_m,
+        ),
+        "datetime_to_absolutedate": datetime_to_absolutedate,
+        "iono_model": KlobucharIonoModel(klobuchar_alpha, klobuchar_beta) if ATM.enable_klobuchar else None,
+        "tropo_model": ModifiedHopfieldModel(TroposphericModelUtils.STANDARD_ATMOSPHERE_PROVIDER)
+        if ATM.enable_hopfield
+        else None,
+        "klobuchar_alpha": np.asarray(klobuchar_alpha, dtype=float),
+        "klobuchar_beta": np.asarray(klobuchar_beta, dtype=float),
+        "klobuchar_source": klobuchar_source,
+    }
+
+
+def finite_difference(values: np.ndarray, t_sec: np.ndarray) -> np.ndarray:
+    if values.size < 2:
+        return np.zeros_like(values)
+    edge_order = 2 if values.size >= 3 else 1
+    return np.gradient(values, t_sec, edge_order=edge_order)
+
+
+def compute_tracking_angles(
+    receiver: ReceiverConfig,
+    rs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    az_deg, el_deg, slant_range_m = pm.ecef2aer(
+        rs[0],
+        rs[1],
+        rs[2],
+        receiver.latitude_deg,
+        receiver.longitude_deg,
+        receiver.altitude_m,
+        deg=True,
+    )
+    return (
+        np.asarray(az_deg, dtype=float),
+        np.asarray(el_deg, dtype=float),
+        np.asarray(slant_range_m, dtype=float),
+    )
+
+
+def build_observation_atmosphere(
+    receiver: ReceiverConfig,
+    observation_start_utc: str,
+    t_sec: np.ndarray,
+    rs: np.ndarray,
+) -> dict[str, np.ndarray]:
+    azimuth_deg, elevation_deg, slant_range_m = compute_tracking_angles(receiver, rs)
+    iono_delay_m = np.zeros_like(t_sec)
+    tropo_delay_m = np.zeros_like(t_sec)
+
+    if ATM.enable_klobuchar or ATM.enable_hopfield:
+        context = build_atmosphere_context(receiver)
+        start_date = context["datetime_to_absolutedate"](datetime.fromisoformat(observation_start_utc))
+
+        from org.orekit.utils import TrackingCoordinates
+
+        for index in range(t_sec.size):
+            if elevation_deg[index] <= 0.0:
+                continue
+            date = start_date.shiftedBy(float(t_sec[index]))
+            azimuth_rad = math.radians(float(azimuth_deg[index]))
+            elevation_rad = math.radians(float(elevation_deg[index]))
+
+            if context["iono_model"] is not None:
+                iono_delay_m[index] = context["iono_model"].pathDelay(
+                    date,
+                    context["receiver_gp"],
+                    elevation_rad,
+                    azimuth_rad,
+                    ATM.signal_frequency_hz,
+                    context["iono_model"].getParameters(date),
+                )
+            if context["tropo_model"] is not None:
+                tracking = TrackingCoordinates(
+                    azimuth_rad,
+                    elevation_rad,
+                    float(slant_range_m[index]),
+                )
+                tropo_delay_m[index] = context["tropo_model"].pathDelay(
+                    tracking,
+                    context["receiver_gp"],
+                    context["tropo_model"].getParameters(date),
+                    date,
+                ).getDelay()
+
+    total_delay_m = iono_delay_m + tropo_delay_m
+    return {
+        "azimuth_deg": azimuth_deg,
+        "elevation_deg": elevation_deg,
+        "slant_range_m": slant_range_m,
+        "iono_delay_m": iono_delay_m,
+        "tropo_delay_m": tropo_delay_m,
+        "total_delay_m": total_delay_m,
+        "total_delay_rate_mps": finite_difference(total_delay_m, t_sec),
+        "klobuchar_alpha": context["klobuchar_alpha"] if ATM.enable_klobuchar or ATM.enable_hopfield else np.asarray(ATM.klobuchar_alpha, dtype=float),
+        "klobuchar_beta": context["klobuchar_beta"] if ATM.enable_klobuchar or ATM.enable_hopfield else np.asarray(ATM.klobuchar_beta, dtype=float),
+        "klobuchar_source": np.array(
+            context["klobuchar_source"] if ATM.enable_klobuchar or ATM.enable_hopfield else "config"
+        ),
+    }
+
+
+def summarize_observation_atmosphere(obs_atmosphere: dict[str, np.ndarray]) -> dict[str, float]:
+    return {
+        "iono_mean_m": float(np.mean(obs_atmosphere["iono_delay_m"])),
+        "iono_max_m": float(np.max(obs_atmosphere["iono_delay_m"])),
+        "tropo_mean_m": float(np.mean(obs_atmosphere["tropo_delay_m"])),
+        "tropo_max_m": float(np.max(obs_atmosphere["tropo_delay_m"])),
+        "total_mean_m": float(np.mean(obs_atmosphere["total_delay_m"])),
+        "total_max_m": float(np.max(obs_atmosphere["total_delay_m"])),
+        "total_rate_rms_mps": rms(obs_atmosphere["total_delay_rate_mps"]),
+    }
 
 
 def load_pass_record(index_file: Path, satellite_name: str, pass_index: int) -> dict[str, Any]:
@@ -165,7 +384,11 @@ def load_step1_pass(pass_file: Path, orbit_source: str) -> dict[str, Any]:
         }
 
 
-def slice_observation_window(time_seconds: np.ndarray, rs: np.ndarray, vs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def slice_observation_window(
+    time_seconds: np.ndarray,
+    rs: np.ndarray,
+    vs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     if DATA.use_full_pass:
         idx = np.arange(time_seconds.size)
     else:
@@ -181,9 +404,10 @@ def slice_observation_window(time_seconds: np.ndarray, rs: np.ndarray, vs: np.nd
         if idx.size == 0:
             raise ValueError("Measurement decimation removed all observation epochs.")
 
+    start_offset_sec = float(time_seconds[idx[0]])
     t_sec = time_seconds[idx].copy()
-    t_sec -= t_sec[0]
-    return t_sec, rs[:, idx], vs[:, idx]
+    t_sec -= start_offset_sec
+    return t_sec, rs[:, idx], vs[:, idx], start_offset_sec
 
 
 def rho_jac_ecef(pos: np.ndarray, rs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -494,9 +718,80 @@ def build_profile_geometry_summary(obs_cfg: dict[str, float | str], rr_true: np.
     }
 
 
+def build_error_ellipse_enu(
+    east_north_samples_m: np.ndarray,
+    probability: float = 0.90,
+    point_count: int = 361,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mean = np.mean(east_north_samples_m, axis=0)
+    covariance = np.cov(east_north_samples_m, rowvar=False, bias=True)
+    covariance = 0.5 * (covariance + covariance.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    eigenvalues = np.maximum(eigenvalues, 0.0)
+    scale = math.sqrt(-2.0 * math.log(max(1.0 - probability, np.finfo(float).tiny)))
+    angles = np.linspace(0.0, 2.0 * math.pi, point_count)
+    unit_circle = np.vstack((np.cos(angles), np.sin(angles)))
+    ellipse = mean.reshape(2, 1) + eigenvectors @ np.diag(scale * np.sqrt(eigenvalues)) @ unit_circle
+    return ellipse, mean, covariance
+
+
+def symmetric_plot_limit(*arrays: np.ndarray, padding: float = 0.15, minimum_half_span: float = 5.0) -> float:
+    max_abs = 0.0
+    for array in arrays:
+        if array.size:
+            max_abs = max(max_abs, float(np.max(np.abs(array))))
+    return max(max_abs * (1.0 + padding), minimum_half_span)
+
+
+def save_monte_carlo_scatter_plot(
+    figure_path: Path,
+    result: dict[str, Any],
+    satellite_name: str,
+    pass_index: int,
+) -> None:
+    valid = result["ok"]
+    east_north = result["err_enu_all"][valid, :2]
+    ellipse, mean_en, _ = build_error_ellipse_enu(east_north, probability=0.90)
+    limit = symmetric_plot_limit(east_north, ellipse.T)
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 6), sharex=True, sharey=True)
+
+    axes[0].scatter(east_north[:, 0], east_north[:, 1], s=18, alpha=0.55, color="#1f77b4", linewidths=0.0)
+    axes[0].plot(ellipse[0], ellipse[1], color="#d62728", linewidth=2.0, label="90% ellipse")
+    axes[0].scatter([0.0], [0.0], marker="*", s=180, color="#ff7f0e", label="True receiver")
+    axes[0].scatter([mean_en[0]], [mean_en[1]], marker="x", s=90, color="#2ca02c", label="Sample mean")
+    axes[0].axhline(0.0, color="0.75", linewidth=0.8)
+    axes[0].axvline(0.0, color="0.75", linewidth=0.8)
+    axes[0].set_title("Monte Carlo EN Error Scatter")
+    axes[0].set_xlabel("East Error (m)")
+    axes[0].set_ylabel("North Error (m)")
+    axes[0].legend(loc="best")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].scatter(east_north[:, 0], east_north[:, 1], s=18, alpha=0.45, color="#1f77b4", linewidths=0.0)
+    axes[1].plot(ellipse[0], ellipse[1], color="#d62728", linewidth=2.0, label="90% ellipse")
+    axes[1].scatter([0.0], [0.0], marker="*", s=180, color="#ff7f0e", label="Receiver")
+    axes[1].scatter([mean_en[0]], [mean_en[1]], marker="x", s=90, color="#2ca02c", label="Mean estimate")
+    axes[1].set_title("Receiver and EN Positioning Scatter")
+    axes[1].set_xlabel("East in Local Receiver Frame (m)")
+    axes[1].legend(loc="best")
+    axes[1].grid(True, alpha=0.3)
+
+    for axis in axes:
+        axis.set_xlim(-limit, limit)
+        axis.set_ylim(-limit, limit)
+        axis.set_aspect("equal", adjustable="box")
+
+    figure.suptitle(f"{satellite_name} Pass {pass_index:02d} | {result['obs_cfg']['noise_profile']}")
+    figure.tight_layout()
+    figure.savefig(figure_path, dpi=180)
+    plt.close(figure)
+
+
 def run_single_trial_case(
     obs_cfg: dict[str, float | str],
     geom_case: dict[str, Any],
+    obs_atmosphere: dict[str, np.ndarray],
     x0: np.ndarray,
     rr_true: np.ndarray,
     rs: np.ndarray,
@@ -508,8 +803,14 @@ def run_single_trial_case(
     rng = np.random.default_rng(RUN.single_trial_seed)
     noise_rho = float(obs_cfg["sigma_rho_m"]) * rng.standard_normal(t_sec.size)
     noise_rhodot = float(obs_cfg["sigma_rhodot_mps"]) * rng.standard_normal(t_sec.size)
-    y_rho = rho_geom + float(obs_cfg["cb0_true_m"]) + float(obs_cfg["cdot_true_mps"]) * t_sec + noise_rho
-    y_rhodot = rd_geom + float(obs_cfg["cdot_true_mps"]) + noise_rhodot
+    y_rho = (
+        rho_geom
+        + float(obs_cfg["cb0_true_m"])
+        + float(obs_cfg["cdot_true_mps"]) * t_sec
+        + obs_atmosphere["total_delay_m"]
+        + noise_rho
+    )
+    y_rhodot = rd_geom + float(obs_cfg["cdot_true_mps"]) + obs_atmosphere["total_delay_rate_mps"] + noise_rhodot
 
     xhat, info = solve_single_sat_ecefpos_cb_cdot_wls_batches(
         x0,
@@ -548,6 +849,7 @@ def run_single_trial_case(
         "err_horiz": err_horiz,
         "err_3d": err_3d,
         "post_sigma": post_sigma,
+        "obs_atmosphere": obs_atmosphere,
         "info": info,
     }
 
@@ -555,6 +857,7 @@ def run_single_trial_case(
 def run_monte_carlo_case(
     obs_cfg: dict[str, float | str],
     geom_case: dict[str, Any],
+    obs_atmosphere: dict[str, np.ndarray],
     x0: np.ndarray,
     rr_true: np.ndarray,
     rs: np.ndarray,
@@ -579,8 +882,14 @@ def run_monte_carlo_case(
         rng = np.random.default_rng(MC.base_seed + index + 1)
         noise_rho = float(obs_cfg["sigma_rho_m"]) * rng.standard_normal(t_sec.size)
         noise_rhodot = float(obs_cfg["sigma_rhodot_mps"]) * rng.standard_normal(t_sec.size)
-        y_rho = rho_geom + float(obs_cfg["cb0_true_m"]) + float(obs_cfg["cdot_true_mps"]) * t_sec + noise_rho
-        y_rhodot = rd_geom + float(obs_cfg["cdot_true_mps"]) + noise_rhodot
+        y_rho = (
+            rho_geom
+            + float(obs_cfg["cb0_true_m"])
+            + float(obs_cfg["cdot_true_mps"]) * t_sec
+            + obs_atmosphere["total_delay_m"]
+            + noise_rho
+        )
+        y_rhodot = rd_geom + float(obs_cfg["cdot_true_mps"]) + obs_atmosphere["total_delay_rate_mps"] + noise_rhodot
 
         try:
             xhat, info = solve_single_sat_ecefpos_cb_cdot_wls_batches(
@@ -673,16 +982,28 @@ def run_monte_carlo_case(
         "ratio_rmse_U": float(rmse_enu[2] / geom_case["sigmaU_crlb"]),
         "ratio_horiz": float(rms_horiz / geom_case["horiz_rms_crlb"]),
         "ratio_3d": float(rms_3d / geom_case["rms3d_crlb"]),
+        "obs_atmosphere": obs_atmosphere,
     }
 
 
 def json_summary(result: dict[str, Any], satellite_name: str, pass_index: int) -> dict[str, Any]:
+    obs_atmosphere_summary = summarize_observation_atmosphere(result["obs_atmosphere"])
     summary = {
         "satellite_name": satellite_name,
         "pass_index": pass_index,
         "orbit_source": SELECTION.orbit_source,
         "mode": result["mode"],
         "noise_profile": result["obs_cfg"]["noise_profile"],
+        "atmosphere": {
+            "enable_klobuchar": ATM.enable_klobuchar,
+            "enable_hopfield": ATM.enable_hopfield,
+            "signal_frequency_hz": ATM.signal_frequency_hz,
+            "klobuchar_nav_file": ATM.klobuchar_nav_file,
+            "klobuchar_source": scalar_string(result["obs_atmosphere"]["klobuchar_source"]),
+            "klobuchar_alpha": np.asarray(result["obs_atmosphere"]["klobuchar_alpha"], dtype=float).tolist(),
+            "klobuchar_beta": np.asarray(result["obs_atmosphere"]["klobuchar_beta"], dtype=float).tolist(),
+            **obs_atmosphere_summary,
+        },
     }
     if result["mode"] == "single_trial":
         summary.update(
@@ -734,6 +1055,14 @@ def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: i
             "x_est": result["x_est"],
             "dpos": result["dpos"],
             "post_sigma": result["post_sigma"],
+            "azimuth_deg": result["obs_atmosphere"]["azimuth_deg"],
+            "elevation_deg": result["obs_atmosphere"]["elevation_deg"],
+            "klobuchar_alpha": result["obs_atmosphere"]["klobuchar_alpha"],
+            "klobuchar_beta": result["obs_atmosphere"]["klobuchar_beta"],
+            "iono_delay_m": result["obs_atmosphere"]["iono_delay_m"],
+            "tropo_delay_m": result["obs_atmosphere"]["tropo_delay_m"],
+            "total_delay_m": result["obs_atmosphere"]["total_delay_m"],
+            "total_delay_rate_mps": result["obs_atmosphere"]["total_delay_rate_mps"],
             "v_rho_all": result["info"]["v_rho_all"],
             "v_rhodot_all": result["info"]["v_rhodot_all"],
             "iter_hist": result["info"]["iter_hist"],
@@ -748,9 +1077,25 @@ def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: i
             "err_3d_all": result["err_3d_all"],
             "cost_all": result["cost_all"],
             "iter_last_all": result["iter_last_all"],
+            "azimuth_deg": result["obs_atmosphere"]["azimuth_deg"],
+            "elevation_deg": result["obs_atmosphere"]["elevation_deg"],
+            "klobuchar_alpha": result["obs_atmosphere"]["klobuchar_alpha"],
+            "klobuchar_beta": result["obs_atmosphere"]["klobuchar_beta"],
+            "iono_delay_m": result["obs_atmosphere"]["iono_delay_m"],
+            "tropo_delay_m": result["obs_atmosphere"]["tropo_delay_m"],
+            "total_delay_m": result["obs_atmosphere"]["total_delay_m"],
+            "total_delay_rate_mps": result["obs_atmosphere"]["total_delay_rate_mps"],
             "ok": result["ok"].astype(np.int8),
         }
     np.savez_compressed(OUTPUT_DIR / f"{stem}.npz", **raw_arrays)
+
+    if result["mode"] == "monte_carlo":
+        save_monte_carlo_scatter_plot(
+            OUTPUT_DIR / f"{stem}_scatter.png",
+            result,
+            satellite_name,
+            pass_index,
+        )
 
 
 def main() -> int:
@@ -758,19 +1103,40 @@ def main() -> int:
         pass_record = load_pass_record(STEP1_INDEX_FILE, SELECTION.satellite_name, SELECTION.pass_index)
         pass_data = load_step1_pass(Path(pass_record["file"]), SELECTION.orbit_source)
 
-        rr_true = receiver_ecef(RECEIVER)
+        receiver_cfg = ReceiverConfig(
+            latitude_deg=float(pass_data["receiver_lla_deg_m"][0]),
+            longitude_deg=float(pass_data["receiver_lla_deg_m"][1]),
+            altitude_m=float(pass_data["receiver_lla_deg_m"][2]),
+        )
+        rr_true = np.asarray(pass_data["receiver_ecef_m"], dtype=float).reshape(3)
         lat_deg, lon_deg, h_true = pm.ecef2geodetic(rr_true[0], rr_true[1], rr_true[2], deg=True)
-        t_sec, rs, vs = slice_observation_window(pass_data["time_seconds"], pass_data["rs_ecef"], pass_data["vs_ecef"])
+        t_sec, rs, vs, obs_start_offset_sec = slice_observation_window(
+            pass_data["time_seconds"],
+            pass_data["rs_ecef"],
+            pass_data["vs_ecef"],
+        )
+        obs_start_dt = datetime.fromisoformat(pass_data["pass_start_utc"]) + timedelta(seconds=obs_start_offset_sec)
+        obs_start_utc = obs_start_dt.isoformat()
         rho_geom, _ = rho_jac_ecef(rr_true, rs)
         rd_geom, _ = rhodot_jac_ecef(rr_true, rs, vs)
+        obs_atmosphere = build_observation_atmosphere(receiver_cfg, obs_start_utc, t_sec, rs)
+        obs_atmosphere_summary = summarize_observation_atmosphere(obs_atmosphere)
 
         print(f"Selected satellite: {pass_data['satellite_name']} | pass {pass_data['pass_index']:02d}")
         print(f"Orbit source for synthetic observations: {SELECTION.orbit_source}")
         print(f"Receiver LLA [deg, deg, m]: [{lat_deg:.6f}, {lon_deg:.6f}, {h_true:.3f}]")
         print(f"Number of epochs used: {t_sec.size}")
         print(f"Pass interval: {pass_data['pass_start_utc']} -> {pass_data['pass_end_utc']}")
+        print(f"Observation interval start: {obs_start_utc}")
+        print(f"Klobuchar coefficient source: {scalar_string(obs_atmosphere['klobuchar_source'])}")
         print(f"RMS geometry self-check rho = {rms(rho_geom - rho_geom):.3e} m")
         print(f"RMS geometry self-check rhodot = {rms(rd_geom - rd_geom):.3e} m/s")
+        print(
+            "Atmospheric delays | "
+            f"iono mean/max = {obs_atmosphere_summary['iono_mean_m']:.3f}/{obs_atmosphere_summary['iono_max_m']:.3f} m | "
+            f"tropo mean/max = {obs_atmosphere_summary['tropo_mean_m']:.3f}/{obs_atmosphere_summary['tropo_max_m']:.3f} m | "
+            f"total rate RMS = {obs_atmosphere_summary['total_rate_rms_mps']:.6f} m/s"
+        )
 
         init_rng = np.random.default_rng(12345)
         pos0 = make_horizontal_initial_guess_unprojected(rr_true, INIT.initial_offset_km * 1.0e3, init_rng)
@@ -801,7 +1167,7 @@ def main() -> int:
             )
 
             if RUN.single_trial_only:
-                result = run_single_trial_case(obs_cfg, geom_case, x0, rr_true, rs, vs, t_sec, rho_geom, rd_geom)
+                result = run_single_trial_case(obs_cfg, geom_case, obs_atmosphere, x0, rr_true, rs, vs, t_sec, rho_geom, rd_geom)
                 print(
                     f"Single trial | horiz = {result['err_horiz']:.6f} m | "
                     f"3D = {result['err_3d']:.6f} m | "
@@ -809,7 +1175,18 @@ def main() -> int:
                     f"rhodot RMS = {rms(result['info']['v_rhodot_all']):.6f} m/s"
                 )
             else:
-                result = run_monte_carlo_case(obs_cfg, geom_case, x0, rr_true, rs, vs, t_sec, rho_geom, rd_geom)
+                result = run_monte_carlo_case(
+                    obs_cfg,
+                    geom_case,
+                    obs_atmosphere,
+                    x0,
+                    rr_true,
+                    rs,
+                    vs,
+                    t_sec,
+                    rho_geom,
+                    rd_geom,
+                )
                 print(
                     f"Monte Carlo | valid = {result['Nok']:4d}/{MC.trial_count:4d} | "
                     f"horiz RMS = {result['rms_horiz']:.6f} m | "
@@ -824,13 +1201,14 @@ def main() -> int:
         if RUN.save_results:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             sweep_summary = {
-                "receiver": asdict(RECEIVER),
+                "receiver": asdict(receiver_cfg),
                 "selection": asdict(SELECTION),
                 "data": asdict(DATA),
                 "truth": asdict(TRUTH),
                 "init": asdict(INIT),
                 "wls": asdict(WLS),
                 "monte_carlo": asdict(MC),
+                "atmosphere": asdict(ATM),
                 "run": asdict(RUN),
                 "profiles": [json_summary(result, pass_data["satellite_name"], pass_data["pass_index"]) for result in results],
             }
