@@ -162,11 +162,6 @@ def resolve_signal_frequency_hz(satellite_name: str) -> float:
     return ATM.signal_frequency_hz
 
 
-def receiver_ecef(receiver: ReceiverConfig) -> np.ndarray:
-    x, y, z = pm.geodetic2ecef(receiver.latitude_deg, receiver.longitude_deg, receiver.altitude_m, deg=True)
-    return np.array([x, y, z], dtype=float)
-
-
 def download_file(url: str, destination: Path, max_retries: int = 3) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
@@ -834,6 +829,73 @@ def add_zoom_inset(
     axis.indicate_inset_zoom(inset, edgecolor="0.4", alpha=0.9)
 
 
+def smooth_series(values: np.ndarray, window_size: int) -> np.ndarray:
+    if values.size == 0:
+        return values.copy()
+    window_size = max(3, int(window_size))
+    if window_size % 2 == 0:
+        window_size += 1
+    window_size = min(window_size, values.size if values.size % 2 == 1 else max(values.size - 1, 1))
+    if window_size <= 1:
+        return values.copy()
+    kernel = np.ones(window_size, dtype=float) / window_size
+    padded = np.pad(values, (window_size // 2, window_size // 2), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def residual_plot_payload(result: dict[str, Any]) -> dict[str, Any]:
+    if result["mode"] == "single_trial":
+        return {
+            "time_sec": result["time_sec"],
+            "v_rho_all": result["info"]["v_rho_all"],
+            "v_rhodot_all": result["info"]["v_rhodot_all"],
+            "label": "Single-trial post-fit residuals",
+        }
+    return {
+        "time_sec": result["diagnostic_trial"]["time_sec"],
+        "v_rho_all": result["diagnostic_trial"]["v_rho_all"],
+        "v_rhodot_all": result["diagnostic_trial"]["v_rhodot_all"],
+        "label": "Representative Monte Carlo post-fit residuals",
+    }
+
+
+def save_residual_observation_plot(
+    figure_path: Path,
+    result: dict[str, Any],
+    satellite_name: str,
+    pass_index: int,
+) -> None:
+    payload = residual_plot_payload(result)
+    t_sec = np.asarray(payload["time_sec"], dtype=float)
+    residual_rho = np.asarray(payload["v_rho_all"], dtype=float)
+    residual_rhodot = np.asarray(payload["v_rhodot_all"], dtype=float)
+    smooth_window = max(5, min(51, (t_sec.size // 20) | 1))
+    rho_smooth = smooth_series(residual_rho, smooth_window)
+    rhodot_smooth = smooth_series(residual_rhodot, smooth_window)
+
+    figure, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    plot_specs = (
+        (axes[0], residual_rho, rho_smooth, "Post-fit Pseudorange Residual", "Residual (m)", "#1f77b4"),
+        (axes[1], residual_rhodot, rhodot_smooth, "Post-fit Range-rate Residual", "Residual (m/s)", "#2ca02c"),
+    )
+    for axis, raw, smooth, title, ylabel, color in plot_specs:
+        axis.plot(t_sec, raw, color=color, linewidth=0.9, alpha=0.55, label="Raw residual")
+        axis.plot(t_sec, smooth, color="#d62728", linewidth=2.0, label=f"Moving average ({smooth_window})")
+        axis.axhline(0.0, color="0.35", linewidth=0.8, linestyle="--")
+        axis.set_title(title)
+        axis.set_ylabel(ylabel)
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best")
+
+    axes[1].set_xlabel("Time Since Observation Start (s)")
+    figure.suptitle(
+        f"{satellite_name} Pass {pass_index:02d} | {result['obs_cfg']['noise_profile']} | {payload['label']}"
+    )
+    figure.tight_layout()
+    figure.savefig(figure_path, dpi=180)
+    plt.close(figure)
+
+
 def save_monte_carlo_scatter_plot(
     figure_path: Path,
     result: dict[str, Any],
@@ -881,9 +943,51 @@ def save_monte_carlo_scatter_plot(
     plt.close(figure)
 
 
-def run_single_trial_case(
+def synthesize_observations(
     obs_cfg: dict[str, float | str],
-    geom_case: dict[str, Any],
+    obs_atmosphere: dict[str, np.ndarray],
+    t_sec: np.ndarray,
+    rho_geom: np.ndarray,
+    rd_geom: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    cb0_true = float(obs_cfg["cb0_true_m"])
+    cdot_true = float(obs_cfg["cdot_true_mps"])
+    return (
+        rho_geom
+        + cb0_true
+        + cdot_true * t_sec
+        + obs_atmosphere["total_delay_m"]
+        + float(obs_cfg["sigma_rho_m"]) * rng.standard_normal(t_sec.size),
+        rd_geom
+        + cdot_true
+        + obs_atmosphere["total_delay_rate_mps"]
+        + float(obs_cfg["sigma_rhodot_mps"]) * rng.standard_normal(t_sec.size),
+    )
+
+
+def build_trial_error_metrics(
+    state: np.ndarray,
+    rr_true: np.ndarray,
+    obs_cfg: dict[str, float | str],
+) -> dict[str, Any]:
+    dpos = state[:3] - rr_true
+    dE, dN, dU = enu_error_components(dpos, rr_true)
+    return {
+        "x_est": state.copy(),
+        "dpos": dpos,
+        "dE": dE,
+        "dN": dN,
+        "dU": dU,
+        "dcb0": float(state[3] - obs_cfg["cb0_true_m"]),
+        "dcdot": float(state[4] - obs_cfg["cdot_true_mps"]),
+        "err_horiz": float(math.hypot(dE, dN)),
+        "err_3d": float(np.linalg.norm(dpos)),
+    }
+
+
+def run_position_trial(
+    obs_cfg: dict[str, float | str],
     obs_atmosphere: dict[str, np.ndarray],
     x0: np.ndarray,
     rr_true: np.ndarray,
@@ -892,19 +996,9 @@ def run_single_trial_case(
     t_sec: np.ndarray,
     rho_geom: np.ndarray,
     rd_geom: np.ndarray,
+    rng: np.random.Generator,
 ) -> dict[str, Any]:
-    rng = np.random.default_rng(RUN.single_trial_seed)
-    noise_rho = float(obs_cfg["sigma_rho_m"]) * rng.standard_normal(t_sec.size)
-    noise_rhodot = float(obs_cfg["sigma_rhodot_mps"]) * rng.standard_normal(t_sec.size)
-    y_rho = (
-        rho_geom
-        + float(obs_cfg["cb0_true_m"])
-        + float(obs_cfg["cdot_true_mps"]) * t_sec
-        + obs_atmosphere["total_delay_m"]
-        + noise_rho
-    )
-    y_rhodot = rd_geom + float(obs_cfg["cdot_true_mps"]) + obs_atmosphere["total_delay_rate_mps"] + noise_rhodot
-
+    y_rho, y_rhodot = synthesize_observations(obs_cfg, obs_atmosphere, t_sec, rho_geom, rd_geom, rng)
     xhat, info = solve_single_sat_ecefpos_cb_cdot_wls_batches(
         x0,
         y_rho,
@@ -916,34 +1010,62 @@ def run_single_trial_case(
         float(obs_cfg["sigma_rho_m"]),
         float(obs_cfg["sigma_rhodot_mps"]),
     )
-    if not info["converged"]:
-        raise RuntimeError(f"Single-trial solver did not converge for profile {obs_cfg['noise_profile']}.")
+    return (
+        {"info": info, "converged": True, **build_trial_error_metrics(xhat["state"], rr_true, obs_cfg)}
+        if info["converged"]
+        else {"info": info, "converged": False}
+    )
 
-    x_est = xhat["state"]
-    dpos = x_est[:3] - rr_true
-    dcb0 = float(x_est[3] - obs_cfg["cb0_true_m"])
-    dcdot = float(x_est[4] - obs_cfg["cdot_true_mps"])
-    dE, dN, dU = enu_error_components(dpos, rr_true)
-    err_horiz = float(math.hypot(dE, dN))
-    err_3d = float(np.linalg.norm(dpos))
-    post_sigma = np.sqrt(np.maximum(np.diag(info["P"]), 0.0))
+
+def store_monte_carlo_trial(
+    result_arrays: dict[str, np.ndarray],
+    index: int,
+    trial: dict[str, Any],
+) -> None:
+    result_arrays["x_est_all"][index] = trial["x_est"]
+    result_arrays["err_state_all"][index] = np.array([*trial["dpos"], trial["dcb0"], trial["dcdot"]], dtype=float)
+    result_arrays["err_enu_all"][index] = np.array([trial["dE"], trial["dN"], trial["dU"]], dtype=float)
+    result_arrays["err_horiz_all"][index] = trial["err_horiz"]
+    result_arrays["err_3d_all"][index] = trial["err_3d"]
+    if trial["info"]["cost_hist"].size:
+        result_arrays["cost_all"][index] = float(trial["info"]["cost_hist"][-1])
+    if trial["info"]["iter_hist"].size:
+        result_arrays["iter_last_all"][index] = float(trial["info"]["iter_hist"][-1])
+
+
+def run_single_trial_case(
+    obs_cfg: dict[str, float | str],
+    obs_atmosphere: dict[str, np.ndarray],
+    x0: np.ndarray,
+    rr_true: np.ndarray,
+    rs: np.ndarray,
+    vs: np.ndarray,
+    t_sec: np.ndarray,
+    rho_geom: np.ndarray,
+    rd_geom: np.ndarray,
+) -> dict[str, Any]:
+    trial = run_position_trial(
+        obs_cfg,
+        obs_atmosphere,
+        x0,
+        rr_true,
+        rs,
+        vs,
+        t_sec,
+        rho_geom,
+        rd_geom,
+        np.random.default_rng(RUN.single_trial_seed),
+    )
+    if not trial["converged"]:
+        raise RuntimeError(f"Single-trial solver did not converge for profile {obs_cfg['noise_profile']}.")
 
     return {
         "mode": "single_trial",
         "obs_cfg": obs_cfg,
-        "geom_case": geom_case,
-        "x_est": x_est,
-        "dpos": dpos,
-        "dE": dE,
-        "dN": dN,
-        "dU": dU,
-        "dcb0": dcb0,
-        "dcdot": dcdot,
-        "err_horiz": err_horiz,
-        "err_3d": err_3d,
-        "post_sigma": post_sigma,
+        **trial,
+        "time_sec": t_sec.copy(),
+        "post_sigma": np.sqrt(np.maximum(np.diag(trial["info"]["P"]), 0.0)),
         "obs_atmosphere": obs_atmosphere,
-        "info": info,
     }
 
 
@@ -960,79 +1082,64 @@ def run_monte_carlo_case(
     rd_geom: np.ndarray,
 ) -> dict[str, Any]:
     trial_count = MC.trial_count
-    x_est_all = np.full((trial_count, 5), np.nan, dtype=float)
-    err_state_all = np.full((trial_count, 5), np.nan, dtype=float)
-    err_enu_all = np.full((trial_count, 3), np.nan, dtype=float)
-    err_horiz_all = np.full(trial_count, np.nan, dtype=float)
-    err_3d_all = np.full(trial_count, np.nan, dtype=float)
-    cost_all = np.full(trial_count, np.nan, dtype=float)
-    iter_last_all = np.full(trial_count, np.nan, dtype=float)
-    fail_flag = np.zeros(trial_count, dtype=bool)
-    conv_flag_all = np.zeros(trial_count, dtype=bool)
+    result_arrays = {
+        "x_est_all": np.full((trial_count, 5), np.nan, dtype=float),
+        "err_state_all": np.full((trial_count, 5), np.nan, dtype=float),
+        "err_enu_all": np.full((trial_count, 3), np.nan, dtype=float),
+        "err_horiz_all": np.full(trial_count, np.nan, dtype=float),
+        "err_3d_all": np.full(trial_count, np.nan, dtype=float),
+        "cost_all": np.full(trial_count, np.nan, dtype=float),
+        "iter_last_all": np.full(trial_count, np.nan, dtype=float),
+        "fail_flag": np.zeros(trial_count, dtype=bool),
+        "conv_flag_all": np.zeros(trial_count, dtype=bool),
+    }
+    diagnostic_trial: dict[str, np.ndarray] | None = None
 
     print(f"\n====== Start Monte Carlo: N = {trial_count} | profile = {obs_cfg['noise_profile']} ======")
     for index in range(trial_count):
-        rng = np.random.default_rng(MC.base_seed + index + 1)
-        noise_rho = float(obs_cfg["sigma_rho_m"]) * rng.standard_normal(t_sec.size)
-        noise_rhodot = float(obs_cfg["sigma_rhodot_mps"]) * rng.standard_normal(t_sec.size)
-        y_rho = (
-            rho_geom
-            + float(obs_cfg["cb0_true_m"])
-            + float(obs_cfg["cdot_true_mps"]) * t_sec
-            + obs_atmosphere["total_delay_m"]
-            + noise_rho
-        )
-        y_rhodot = rd_geom + float(obs_cfg["cdot_true_mps"]) + obs_atmosphere["total_delay_rate_mps"] + noise_rhodot
-
         try:
-            xhat, info = solve_single_sat_ecefpos_cb_cdot_wls_batches(
+            trial = run_position_trial(
+                obs_cfg,
+                obs_atmosphere,
                 x0,
-                y_rho,
-                y_rhodot,
+                rr_true,
                 rs,
                 vs,
                 t_sec,
-                rr_true,
-                float(obs_cfg["sigma_rho_m"]),
-                float(obs_cfg["sigma_rhodot_mps"]),
+                rho_geom,
+                rd_geom,
+                np.random.default_rng(MC.base_seed + index + 1),
             )
-            conv_flag_all[index] = info["converged"]
-            if not info["converged"]:
-                fail_flag[index] = True
+            result_arrays["conv_flag_all"][index] = trial["converged"]
+            if not trial["converged"]:
+                result_arrays["fail_flag"][index] = True
                 continue
-
-            x_est = xhat["state"]
-            dpos = x_est[:3] - rr_true
-            dcb0 = float(x_est[3] - obs_cfg["cb0_true_m"])
-            dcdot = float(x_est[4] - obs_cfg["cdot_true_mps"])
-            dE, dN, dU = enu_error_components(dpos, rr_true)
-
-            x_est_all[index] = x_est
-            err_state_all[index] = np.array([dpos[0], dpos[1], dpos[2], dcb0, dcdot], dtype=float)
-            err_enu_all[index] = np.array([dE, dN, dU], dtype=float)
-            err_horiz_all[index] = float(math.hypot(dE, dN))
-            err_3d_all[index] = float(np.linalg.norm(dpos))
-            if info["cost_hist"].size:
-                cost_all[index] = float(info["cost_hist"][-1])
-            if info["iter_hist"].size:
-                iter_last_all[index] = float(info["iter_hist"][-1])
+            if diagnostic_trial is None:
+                diagnostic_trial = {
+                    "time_sec": t_sec.copy(),
+                    "v_rho_all": trial["info"]["v_rho_all"].copy(),
+                    "v_rhodot_all": trial["info"]["v_rhodot_all"].copy(),
+                }
+            store_monte_carlo_trial(result_arrays, index, trial)
         except Exception as exc:
-            fail_flag[index] = True
+            result_arrays["fail_flag"][index] = True
             if MC.stop_on_failure:
                 raise RuntimeError(f"Monte Carlo failed at trial {index + 1}") from exc
 
         if (index + 1) in {1, trial_count} or (index + 1) % max(1, round(trial_count / 10)) == 0:
             print(f"[{obs_cfg['noise_profile']}] progress: {index + 1:4d} / {trial_count:4d}")
 
-    ok = (~fail_flag) & conv_flag_all & np.all(np.isfinite(err_state_all), axis=1)
+    ok = (~result_arrays["fail_flag"]) & result_arrays["conv_flag_all"] & np.all(np.isfinite(result_arrays["err_state_all"]), axis=1)
     ok_count = int(np.sum(ok))
     if ok_count < 5:
         raise RuntimeError(f"Too few valid Monte Carlo samples for profile {obs_cfg['noise_profile']}: {ok_count}")
+    if diagnostic_trial is None:
+        raise RuntimeError(f"No converged Monte Carlo trial available for residual diagnostics: {obs_cfg['noise_profile']}")
 
-    e_state = err_state_all[ok]
-    e_enu = err_enu_all[ok]
-    e_h = err_horiz_all[ok]
-    e_3d = err_3d_all[ok]
+    e_state = result_arrays["err_state_all"][ok]
+    e_enu = result_arrays["err_enu_all"][ok]
+    e_h = result_arrays["err_horiz_all"][ok]
+    e_3d = result_arrays["err_3d_all"][ok]
 
     bias_state = np.mean(e_state, axis=0)
     cov_state = np.cov(e_state, rowvar=False, bias=True)
@@ -1046,19 +1153,10 @@ def run_monte_carlo_case(
     return {
         "mode": "monte_carlo",
         "obs_cfg": obs_cfg,
-        "geom_case": geom_case,
         "ok": ok,
         "Nok": ok_count,
         "Nfail": int(trial_count - ok_count),
-        "x_est_all": x_est_all,
-        "err_state_all": err_state_all,
-        "err_enu_all": err_enu_all,
-        "err_horiz_all": err_horiz_all,
-        "err_3d_all": err_3d_all,
-        "cost_all": cost_all,
-        "iter_last_all": iter_last_all,
-        "fail_flag": fail_flag,
-        "conv_flag_all": conv_flag_all,
+        **result_arrays,
         "bias_state": bias_state,
         "cov_state": cov_state,
         "rmse_state": rmse_state,
@@ -1075,13 +1173,90 @@ def run_monte_carlo_case(
         "ratio_rmse_U": float(rmse_enu[2] / geom_case["sigmaU_crlb"]),
         "ratio_horiz": float(rms_horiz / geom_case["horiz_rms_crlb"]),
         "ratio_3d": float(rms_3d / geom_case["rms3d_crlb"]),
+        "diagnostic_trial": diagnostic_trial,
         "obs_atmosphere": obs_atmosphere,
     }
 
 
+def atmosphere_export_payload(obs_atmosphere: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    keys = ("azimuth_deg", "elevation_deg", "signal_frequency_hz", "klobuchar_alpha", "klobuchar_beta")
+    keys += ("iono_delay_m", "tropo_delay_m", "total_delay_m", "total_delay_rate_mps")
+    return {key: obs_atmosphere[key] for key in keys}
+
+
+def result_summary_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    if result["mode"] == "single_trial":
+        info = result["info"]
+        return {
+            "err_horiz_m": result["err_horiz"],
+            "err_3d_m": result["err_3d"],
+            "dE_m": result["dE"],
+            "dN_m": result["dN"],
+            "dU_m": result["dU"],
+            "dcb0_m": result["dcb0"],
+            "dcdot_mps": result["dcdot"],
+            "post_sigma": result["post_sigma"].tolist(),
+            "postfit_rho_rms_m": rms(info["v_rho_all"]),
+            "postfit_rhodot_rms_mps": rms(info["v_rhodot_all"]),
+            "last_iterations": int(info["iter_hist"][-1]),
+            "final_cost": float(info["cost_hist"][-1]),
+        }
+    return {
+        "valid_trials": int(result["Nok"]),
+        "failed_trials": int(result["Nfail"]),
+        "rms_horiz_m": result["rms_horiz"],
+        "rms_3d_m": result["rms_3d"],
+        "mean_horiz_m": result["mean_horiz"],
+        "mean_3d_m": result["mean_3d"],
+        "ratio_horiz": result["ratio_horiz"],
+        "ratio_3d": result["ratio_3d"],
+        "ratio_rmse_state": result["ratio_rmse_state"].tolist(),
+        "ratio_rmse_E": result["ratio_rmse_E"],
+        "ratio_rmse_N": result["ratio_rmse_N"],
+        "ratio_rmse_U": result["ratio_rmse_U"],
+    }
+
+
+def result_array_payload(result: dict[str, Any]) -> dict[str, np.ndarray]:
+    base_payload = atmosphere_export_payload(result["obs_atmosphere"])
+    if result["mode"] == "single_trial":
+        return {
+            "x_est": result["x_est"],
+            "dpos": result["dpos"],
+            "time_sec": result["time_sec"],
+            "post_sigma": result["post_sigma"],
+            "v_rho_all": result["info"]["v_rho_all"],
+            "v_rhodot_all": result["info"]["v_rhodot_all"],
+            "iter_hist": result["info"]["iter_hist"],
+            "cost_hist": result["info"]["cost_hist"],
+            **base_payload,
+        }
+    return {
+        "x_est_all": result["x_est_all"],
+        "err_state_all": result["err_state_all"],
+        "err_enu_all": result["err_enu_all"],
+        "err_horiz_all": result["err_horiz_all"],
+        "err_3d_all": result["err_3d_all"],
+        "cost_all": result["cost_all"],
+        "iter_last_all": result["iter_last_all"],
+        "ok": result["ok"].astype(np.int8),
+        "diagnostic_time_sec": result["diagnostic_trial"]["time_sec"],
+        "diagnostic_v_rho_all": result["diagnostic_trial"]["v_rho_all"],
+        "diagnostic_v_rhodot_all": result["diagnostic_trial"]["v_rhodot_all"],
+        **base_payload,
+    }
+
+
+def build_initial_state(rr_true: np.ndarray, h_true: float) -> tuple[np.ndarray, tuple[float, float, float]]:
+    pos0 = make_horizontal_initial_guess_unprojected(rr_true, INIT.initial_offset_km * 1.0e3, np.random.default_rng(12345))
+    pos0 = project_to_fixed_height(pos0, h_true)
+    x0 = np.array([*pos0, INIT.cb0_m, INIT.cdot0_mps], dtype=float)
+    return x0, enu_error_components(pos0 - rr_true, rr_true)
+
+
 def json_summary(result: dict[str, Any], satellite_name: str, pass_index: int, selection: SelectionConfig) -> dict[str, Any]:
     obs_atmosphere_summary = summarize_observation_atmosphere(result["obs_atmosphere"])
-    summary = {
+    return {
         "satellite_name": satellite_name,
         "pass_index": pass_index,
         "orbit_source": selection.orbit_source,
@@ -1097,42 +1272,8 @@ def json_summary(result: dict[str, Any], satellite_name: str, pass_index: int, s
             "klobuchar_beta": np.asarray(result["obs_atmosphere"]["klobuchar_beta"], dtype=float).tolist(),
             **obs_atmosphere_summary,
         },
+        **result_summary_metrics(result),
     }
-    if result["mode"] == "single_trial":
-        summary.update(
-            {
-                "err_horiz_m": result["err_horiz"],
-                "err_3d_m": result["err_3d"],
-                "dE_m": result["dE"],
-                "dN_m": result["dN"],
-                "dU_m": result["dU"],
-                "dcb0_m": result["dcb0"],
-                "dcdot_mps": result["dcdot"],
-                "post_sigma": result["post_sigma"].tolist(),
-                "postfit_rho_rms_m": rms(result["info"]["v_rho_all"]),
-                "postfit_rhodot_rms_mps": rms(result["info"]["v_rhodot_all"]),
-                "last_iterations": int(result["info"]["iter_hist"][-1]),
-                "final_cost": float(result["info"]["cost_hist"][-1]),
-            }
-        )
-    else:
-        summary.update(
-            {
-                "valid_trials": int(result["Nok"]),
-                "failed_trials": int(result["Nfail"]),
-                "rms_horiz_m": result["rms_horiz"],
-                "rms_3d_m": result["rms_3d"],
-                "mean_horiz_m": result["mean_horiz"],
-                "mean_3d_m": result["mean_3d"],
-                "ratio_horiz": result["ratio_horiz"],
-                "ratio_3d": result["ratio_3d"],
-                "ratio_rmse_state": result["ratio_rmse_state"].tolist(),
-                "ratio_rmse_E": result["ratio_rmse_E"],
-                "ratio_rmse_N": result["ratio_rmse_N"],
-                "ratio_rmse_U": result["ratio_rmse_U"],
-            }
-        )
-    return summary
 
 
 def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: int, selection: SelectionConfig) -> None:
@@ -1142,47 +1283,13 @@ def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: i
     stem = f"{satellite_tag}_pass_{pass_index:02d}_{profile_tag}_{result['mode']}"
     summary_path = OUTPUT_DIR / f"{stem}.json"
     summary_path.write_text(json.dumps(json_summary(result, satellite_name, pass_index, selection), indent=2), encoding="utf-8")
-
-    if result["mode"] == "single_trial":
-        raw_arrays = {
-            "x_est": result["x_est"],
-            "dpos": result["dpos"],
-            "post_sigma": result["post_sigma"],
-            "azimuth_deg": result["obs_atmosphere"]["azimuth_deg"],
-            "elevation_deg": result["obs_atmosphere"]["elevation_deg"],
-            "signal_frequency_hz": result["obs_atmosphere"]["signal_frequency_hz"],
-            "klobuchar_alpha": result["obs_atmosphere"]["klobuchar_alpha"],
-            "klobuchar_beta": result["obs_atmosphere"]["klobuchar_beta"],
-            "iono_delay_m": result["obs_atmosphere"]["iono_delay_m"],
-            "tropo_delay_m": result["obs_atmosphere"]["tropo_delay_m"],
-            "total_delay_m": result["obs_atmosphere"]["total_delay_m"],
-            "total_delay_rate_mps": result["obs_atmosphere"]["total_delay_rate_mps"],
-            "v_rho_all": result["info"]["v_rho_all"],
-            "v_rhodot_all": result["info"]["v_rhodot_all"],
-            "iter_hist": result["info"]["iter_hist"],
-            "cost_hist": result["info"]["cost_hist"],
-        }
-    else:
-        raw_arrays = {
-            "x_est_all": result["x_est_all"],
-            "err_state_all": result["err_state_all"],
-            "err_enu_all": result["err_enu_all"],
-            "err_horiz_all": result["err_horiz_all"],
-            "err_3d_all": result["err_3d_all"],
-            "cost_all": result["cost_all"],
-            "iter_last_all": result["iter_last_all"],
-            "azimuth_deg": result["obs_atmosphere"]["azimuth_deg"],
-            "elevation_deg": result["obs_atmosphere"]["elevation_deg"],
-            "signal_frequency_hz": result["obs_atmosphere"]["signal_frequency_hz"],
-            "klobuchar_alpha": result["obs_atmosphere"]["klobuchar_alpha"],
-            "klobuchar_beta": result["obs_atmosphere"]["klobuchar_beta"],
-            "iono_delay_m": result["obs_atmosphere"]["iono_delay_m"],
-            "tropo_delay_m": result["obs_atmosphere"]["tropo_delay_m"],
-            "total_delay_m": result["obs_atmosphere"]["total_delay_m"],
-            "total_delay_rate_mps": result["obs_atmosphere"]["total_delay_rate_mps"],
-            "ok": result["ok"].astype(np.int8),
-        }
-    np.savez_compressed(OUTPUT_DIR / f"{stem}.npz", **raw_arrays)
+    np.savez_compressed(OUTPUT_DIR / f"{stem}.npz", **result_array_payload(result))
+    save_residual_observation_plot(
+        OUTPUT_DIR / f"{stem}_residuals.png",
+        result,
+        satellite_name,
+        pass_index,
+    )
 
     if result["mode"] == "monte_carlo":
         save_monte_carlo_scatter_plot(
@@ -1191,6 +1298,39 @@ def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: i
             satellite_name,
             pass_index,
         )
+
+
+def run_profile_case(
+    profile_name: str,
+    obs_atmosphere: dict[str, np.ndarray],
+    x0: np.ndarray,
+    rr_true: np.ndarray,
+    rs: np.ndarray,
+    vs: np.ndarray,
+    t_sec: np.ndarray,
+    rho_geom: np.ndarray,
+    rd_geom: np.ndarray,
+) -> dict[str, Any]:
+    obs_cfg = make_obs_cfg(profile_name)
+    geom_case = build_profile_geometry_summary(obs_cfg, rr_true, rs, vs, t_sec)
+    print("\n============================================================")
+    print(f"Noise profile: {profile_name}")
+    print(f"sigma_rho = {obs_cfg['sigma_rho_m']:.3f} m | sigma_rhodot = {obs_cfg['sigma_rhodot_mps']:.3f} m/s")
+    print("CRLB sigma_xyzcbcdot = " + ", ".join(f"{value:.6e}" for value in geom_case["crlb_sigma_state"]))
+    result = run_single_trial_case(obs_cfg, obs_atmosphere, x0, rr_true, rs, vs, t_sec, rho_geom, rd_geom) if RUN.single_trial_only else run_monte_carlo_case(obs_cfg, geom_case, obs_atmosphere, x0, rr_true, rs, vs, t_sec, rho_geom, rd_geom)
+    if RUN.single_trial_only:
+        print(
+            f"Single trial | horiz = {result['err_horiz']:.6f} m | 3D = {result['err_3d']:.6f} m | "
+            f"rho RMS = {rms(result['info']['v_rho_all']):.6f} m | "
+            f"rhodot RMS = {rms(result['info']['v_rhodot_all']):.6f} m/s"
+        )
+    else:
+        print(
+            f"Monte Carlo | valid = {result['Nok']:4d}/{MC.trial_count:4d} | "
+            f"horiz RMS = {result['rms_horiz']:.6f} m | 3D RMS = {result['rms_3d']:.6f} m | "
+            f"ratio_h = {result['ratio_horiz']:.4f} | ratio_3d = {result['ratio_3d']:.4f}"
+        )
+    return result
 
 
 def main() -> int:
@@ -1245,62 +1385,13 @@ def main() -> int:
             f"total rate RMS = {obs_atmosphere_summary['total_rate_rms_mps']:.6f} m/s"
         )
 
-        init_rng = np.random.default_rng(12345)
-        pos0 = make_horizontal_initial_guess_unprojected(rr_true, INIT.initial_offset_km * 1.0e3, init_rng)
-        pos0 = project_to_fixed_height(pos0, h_true)
-        x0 = np.array([pos0[0], pos0[1], pos0[2], INIT.cb0_m, INIT.cdot0_mps], dtype=float)
-        dE0, dN0, dU0 = enu_error_components(pos0 - rr_true, rr_true)
+        x0, (dE0, dN0, dU0) = build_initial_state(rr_true, h_true)
         print(f"Initial ENU error [m]: [{dE0:+.3f}, {dN0:+.3f}, {dU0:+.6f}]")
         print(f"Initial horizontal error [km]: {math.hypot(dE0, dN0) / 1.0e3:.3f}")
 
         results: list[dict[str, Any]] = []
         for profile_name in NOISE_PROFILES:
-            obs_cfg = make_obs_cfg(profile_name)
-            geom_case = build_profile_geometry_summary(obs_cfg, rr_true, rs, vs, t_sec)
-
-            print("\n============================================================")
-            print(f"Noise profile: {profile_name}")
-            print(
-                f"sigma_rho = {obs_cfg['sigma_rho_m']:.3f} m | "
-                f"sigma_rhodot = {obs_cfg['sigma_rhodot_mps']:.3f} m/s"
-            )
-            print(
-                "CRLB sigma_xyzcbcdot = "
-                f"{geom_case['crlb_sigma_state'][0]:.6f}, "
-                f"{geom_case['crlb_sigma_state'][1]:.6f}, "
-                f"{geom_case['crlb_sigma_state'][2]:.6f}, "
-                f"{geom_case['crlb_sigma_state'][3]:.6f}, "
-                f"{geom_case['crlb_sigma_state'][4]:.6e}"
-            )
-
-            if RUN.single_trial_only:
-                result = run_single_trial_case(obs_cfg, geom_case, obs_atmosphere, x0, rr_true, rs, vs, t_sec, rho_geom, rd_geom)
-                print(
-                    f"Single trial | horiz = {result['err_horiz']:.6f} m | "
-                    f"3D = {result['err_3d']:.6f} m | "
-                    f"rho RMS = {rms(result['info']['v_rho_all']):.6f} m | "
-                    f"rhodot RMS = {rms(result['info']['v_rhodot_all']):.6f} m/s"
-                )
-            else:
-                result = run_monte_carlo_case(
-                    obs_cfg,
-                    geom_case,
-                    obs_atmosphere,
-                    x0,
-                    rr_true,
-                    rs,
-                    vs,
-                    t_sec,
-                    rho_geom,
-                    rd_geom,
-                )
-                print(
-                    f"Monte Carlo | valid = {result['Nok']:4d}/{MC.trial_count:4d} | "
-                    f"horiz RMS = {result['rms_horiz']:.6f} m | "
-                    f"3D RMS = {result['rms_3d']:.6f} m | "
-                    f"ratio_h = {result['ratio_horiz']:.4f} | ratio_3d = {result['ratio_3d']:.4f}"
-                )
-
+            result = run_profile_case(profile_name, obs_atmosphere, x0, rr_true, rs, vs, t_sec, rho_geom, rd_geom)
             results.append(result)
             if RUN.save_results:
                 save_result_files(result, pass_data["satellite_name"], pass_data["pass_index"], selection)
