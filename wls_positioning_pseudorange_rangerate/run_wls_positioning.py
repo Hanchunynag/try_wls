@@ -87,9 +87,7 @@ class MonteCarloConfig:
 class AtmosphereConfig:
     enable_klobuchar: bool = True
     enable_hopfield: bool = True
-    iridium_frequency_hz: float = 1_626_270_000.0
-    orbcomm_frequency_hz: float = 137_500_000.0
-    default_signal_frequency_hz: float = 1_575_420_000.0
+    signal_frequency_hz: float = 12_000_000_000.0
     klobuchar_nav_file: str = ""
     klobuchar_alpha: tuple[float, float, float, float] = (2.4214e-08, 1.4901e-08, -1.1921e-07, 0.0)
     klobuchar_beta: tuple[float, float, float, float] = (1.1674e05, -2.2938e05, -1.3107e05, 1.0486e06)
@@ -160,12 +158,8 @@ def rms(values: np.ndarray) -> float:
 
 
 def resolve_signal_frequency_hz(satellite_name: str) -> float:
-    name_upper = satellite_name.strip().upper()
-    if name_upper.startswith("IRIDIUM"):
-        return ATM.iridium_frequency_hz
-    if name_upper.startswith("ORBCOMM"):
-        return ATM.orbcomm_frequency_hz
-    return ATM.default_signal_frequency_hz
+    _ = satellite_name
+    return ATM.signal_frequency_hz
 
 
 def receiver_ecef(receiver: ReceiverConfig) -> np.ndarray:
