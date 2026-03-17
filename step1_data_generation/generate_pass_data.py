@@ -11,9 +11,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import jpype
+import matplotlib
 import numpy as np
 import orekit_jpype
 import requests
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -53,9 +57,17 @@ class HpopConfig:
     max_step_sec: float = 300.0
 
 
+@dataclass(frozen=True)
+class DebugConfig:
+    enable_error_analysis: bool = True
+    position_unit: str = "m"
+    velocity_unit: str = "m/s"
+
+
 SCENARIO = ScenarioConfig()
 RECEIVER = ReceiverConfig()
 HPOP = HpopConfig()
+DEBUG = DebugConfig()
 
 
 def download_file(url: str, destination: Path, max_retries: int = 3) -> None:
@@ -238,6 +250,89 @@ def create_hpop_propagator(initial_state: Any, earth_fixed_frame: Any, config: H
     return propagator
 
 
+def compute_rtn_basis(position_eci_m: np.ndarray, velocity_eci_mps: np.ndarray) -> np.ndarray:
+    radial = position_eci_m / np.linalg.norm(position_eci_m)
+    normal = np.cross(position_eci_m, velocity_eci_mps)
+    normal = normal / np.linalg.norm(normal)
+    transverse = np.cross(normal, radial)
+    transverse = transverse / np.linalg.norm(transverse)
+    return np.column_stack((radial, transverse, normal))
+
+
+def compute_rtn_errors(
+    reference_position_eci_m: np.ndarray,
+    reference_velocity_eci_mps: np.ndarray,
+    test_position_eci_m: np.ndarray,
+    test_velocity_eci_mps: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    sample_count = reference_position_eci_m.shape[0]
+    position_error_rtn = np.zeros((sample_count, 3), dtype=float)
+    velocity_error_rtn = np.zeros((sample_count, 3), dtype=float)
+
+    for index in range(sample_count):
+        basis = compute_rtn_basis(reference_position_eci_m[index], reference_velocity_eci_mps[index])
+        delta_r = test_position_eci_m[index] - reference_position_eci_m[index]
+        delta_v = test_velocity_eci_mps[index] - reference_velocity_eci_mps[index]
+        position_error_rtn[index] = basis.T @ delta_r
+        velocity_error_rtn[index] = basis.T @ delta_v
+
+    return position_error_rtn, velocity_error_rtn
+
+
+def make_error_summary(position_error_rtn_m: np.ndarray, velocity_error_rtn_mps: np.ndarray) -> dict[str, float]:
+    position_norm = np.linalg.norm(position_error_rtn_m, axis=1)
+    velocity_norm = np.linalg.norm(velocity_error_rtn_mps, axis=1)
+    return {
+        "position_r_rms_m": float(np.sqrt(np.mean(position_error_rtn_m[:, 0] ** 2))),
+        "position_t_rms_m": float(np.sqrt(np.mean(position_error_rtn_m[:, 1] ** 2))),
+        "position_n_rms_m": float(np.sqrt(np.mean(position_error_rtn_m[:, 2] ** 2))),
+        "position_3d_rms_m": float(np.sqrt(np.mean(position_norm**2))),
+        "position_3d_max_m": float(np.max(position_norm)),
+        "velocity_r_rms_mps": float(np.sqrt(np.mean(velocity_error_rtn_mps[:, 0] ** 2))),
+        "velocity_t_rms_mps": float(np.sqrt(np.mean(velocity_error_rtn_mps[:, 1] ** 2))),
+        "velocity_n_rms_mps": float(np.sqrt(np.mean(velocity_error_rtn_mps[:, 2] ** 2))),
+        "velocity_3d_rms_mps": float(np.sqrt(np.mean(velocity_norm**2))),
+        "velocity_3d_max_mps": float(np.max(velocity_norm)),
+    }
+
+
+def save_rtn_error_plot(
+    figure_path: Path,
+    satellite_name: str,
+    pass_number: int,
+    time_seconds: np.ndarray,
+    position_error_rtn_m: np.ndarray,
+    velocity_error_rtn_mps: np.ndarray,
+) -> None:
+    figure, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    position_norm = np.linalg.norm(position_error_rtn_m, axis=1)
+    velocity_norm = np.linalg.norm(velocity_error_rtn_mps, axis=1)
+
+    axes[0].plot(time_seconds, position_error_rtn_m[:, 0], label="R", linewidth=1.0)
+    axes[0].plot(time_seconds, position_error_rtn_m[:, 1], label="T", linewidth=1.0)
+    axes[0].plot(time_seconds, position_error_rtn_m[:, 2], label="N", linewidth=1.0)
+    axes[0].plot(time_seconds, position_norm, label="3D norm", linewidth=1.2, color="black")
+    axes[0].set_ylabel("Position Error (m)")
+    axes[0].set_title(f"{satellite_name} Pass {pass_number:02d} | SGP4 - HPOP Position Error in RTN")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="best")
+
+    axes[1].plot(time_seconds, velocity_error_rtn_mps[:, 0], label="R", linewidth=1.0)
+    axes[1].plot(time_seconds, velocity_error_rtn_mps[:, 1], label="T", linewidth=1.0)
+    axes[1].plot(time_seconds, velocity_error_rtn_mps[:, 2], label="N", linewidth=1.0)
+    axes[1].plot(time_seconds, velocity_norm, label="3D norm", linewidth=1.2, color="black")
+    axes[1].set_xlabel("Time Since Pass Start (s)")
+    axes[1].set_ylabel("Velocity Error (m/s)")
+    axes[1].set_title(f"{satellite_name} Pass {pass_number:02d} | SGP4 - HPOP Velocity Error in RTN")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="best")
+
+    figure.tight_layout()
+    figure.savefig(figure_path, dpi=180)
+    plt.close(figure)
+
+
 def generate_satellite_pass_files() -> list[dict[str, Any]]:
     ensure_orekit_ready(OREKIT_DATA_ZIP)
     absolutedate_to_datetime, datetime_to_absolutedate = absolute_date_helpers()
@@ -338,6 +433,14 @@ def generate_satellite_pass_files() -> list[dict[str, Any]]:
                     frames["station"].getElevation(hpop_ecef_pv.getPosition(), frames["earth_fixed"], date)
                 )
 
+            position_error_rtn_m, velocity_error_rtn_mps = compute_rtn_errors(
+                hpop_eci_pos,
+                hpop_eci_vel,
+                sgp4_eci_pos,
+                sgp4_eci_vel,
+            )
+            error_summary = make_error_summary(position_error_rtn_m, velocity_error_rtn_mps)
+
             file_stem = f"{safe_name(tle_entry['name'])}_pass_{pass_number:02d}"
             output_file = OUTPUT_DIR / f"{file_stem}.npz"
             np.savez_compressed(
@@ -368,7 +471,20 @@ def generate_satellite_pass_files() -> list[dict[str, Any]]:
                 sgp4_eci_vel_mps=sgp4_eci_vel,
                 sgp4_ecef_pos_m=sgp4_ecef_pos,
                 sgp4_ecef_vel_mps=sgp4_ecef_vel,
+                sgp4_minus_hpop_pos_rtn_m=position_error_rtn_m,
+                sgp4_minus_hpop_vel_rtn_mps=velocity_error_rtn_mps,
             )
+
+            plot_file = OUTPUT_DIR / f"{file_stem}_rtn_error.png"
+            if DEBUG.enable_error_analysis:
+                save_rtn_error_plot(
+                    plot_file,
+                    tle_entry["name"],
+                    pass_number,
+                    time_seconds,
+                    position_error_rtn_m,
+                    velocity_error_rtn_mps,
+                )
 
             record = {
                 "satellite_name": tle_entry["name"],
@@ -380,12 +496,28 @@ def generate_satellite_pass_files() -> list[dict[str, Any]]:
                 "tle_epoch_utc": tle_epoch_dt.isoformat(),
                 "tle_age_hours": tle_age_hours,
                 "file": str(output_file.resolve()),
+                "rtn_error_plot": str(plot_file.resolve()) if DEBUG.enable_error_analysis else "",
+                "error_summary": error_summary,
             }
             output_records.append(record)
             print(
                 f"[{sat_idx:02d}/{len(tle_catalog):02d}] {tle_entry['name']}: "
                 f"saved pass {pass_number:02d} ({pass_duration_sec:.1f} s) -> {output_file.name}"
             )
+            if DEBUG.enable_error_analysis:
+                print(
+                    "    RTN error RMS | "
+                    f"pos [R,T,N,3D] = "
+                    f"{error_summary['position_r_rms_m']:.3f}, "
+                    f"{error_summary['position_t_rms_m']:.3f}, "
+                    f"{error_summary['position_n_rms_m']:.3f}, "
+                    f"{error_summary['position_3d_rms_m']:.3f} m | "
+                    f"vel [R,T,N,3D] = "
+                    f"{error_summary['velocity_r_rms_mps']:.6f}, "
+                    f"{error_summary['velocity_t_rms_mps']:.6f}, "
+                    f"{error_summary['velocity_n_rms_mps']:.6f}, "
+                    f"{error_summary['velocity_3d_rms_mps']:.6f} m/s"
+                )
 
     scenario_summary = {
         "scenario": {
@@ -399,6 +531,7 @@ def generate_satellite_pass_files() -> list[dict[str, Any]]:
         },
         "receiver": asdict(RECEIVER),
         "hpop": asdict(HPOP),
+        "debug": asdict(DEBUG),
         "tle_file": str(TLE_FILE.resolve()),
         "orekit_data_zip": str(OREKIT_DATA_ZIP.resolve()),
         "passes": output_records,
