@@ -1,0 +1,4 @@
+numpy>=2.0
+orekit-jpype>=13.1
+jpype1>=1.5
+requests>=2.31
