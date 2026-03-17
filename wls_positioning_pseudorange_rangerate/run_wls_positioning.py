@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
@@ -86,7 +87,9 @@ class MonteCarloConfig:
 class AtmosphereConfig:
     enable_klobuchar: bool = True
     enable_hopfield: bool = True
-    signal_frequency_hz: float = 1_575_420_000.0
+    iridium_frequency_hz: float = 1_626_270_000.0
+    orbcomm_frequency_hz: float = 137_500_000.0
+    default_signal_frequency_hz: float = 1_575_420_000.0
     klobuchar_nav_file: str = ""
     klobuchar_alpha: tuple[float, float, float, float] = (2.4214e-08, 1.4901e-08, -1.1921e-07, 0.0)
     klobuchar_beta: tuple[float, float, float, float] = (1.1674e05, -2.2938e05, -1.3107e05, 1.0486e06)
@@ -125,12 +128,44 @@ def scalar_number(value: np.ndarray | float | int) -> float:
     return float(array.item() if array.shape == () else array.reshape(-1)[0])
 
 
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run single-satellite WLS positioning from step1 pass data.")
+    parser.add_argument("--list-passes", action="store_true", help="List available satellite passes and exit.")
+    parser.add_argument(
+        "--satellite-name",
+        default=SELECTION.satellite_name,
+        help="Satellite name to use for positioning.",
+    )
+    parser.add_argument(
+        "--pass-index",
+        type=int,
+        default=SELECTION.pass_index,
+        help="Pass index for the selected satellite.",
+    )
+    parser.add_argument(
+        "--orbit-source",
+        choices=("HPOP", "SGP4"),
+        default=SELECTION.orbit_source,
+        help="Orbit source used to synthesize measurements.",
+    )
+    return parser.parse_args(argv)
+
+
 def sanitize_tag(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]+", "_", text).strip("_")
 
 
 def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(values))))
+
+
+def resolve_signal_frequency_hz(satellite_name: str) -> float:
+    name_upper = satellite_name.strip().upper()
+    if name_upper.startswith("IRIDIUM"):
+        return ATM.iridium_frequency_hz
+    if name_upper.startswith("ORBCOMM"):
+        return ATM.orbcomm_frequency_hz
+    return ATM.default_signal_frequency_hz
 
 
 def receiver_ecef(receiver: ReceiverConfig) -> np.ndarray:
@@ -266,6 +301,7 @@ def build_observation_atmosphere(
     observation_start_utc: str,
     t_sec: np.ndarray,
     rs: np.ndarray,
+    signal_frequency_hz: float,
 ) -> dict[str, np.ndarray]:
     azimuth_deg, elevation_deg, slant_range_m = compute_tracking_angles(receiver, rs)
     iono_delay_m = np.zeros_like(t_sec)
@@ -290,7 +326,7 @@ def build_observation_atmosphere(
                     context["receiver_gp"],
                     elevation_rad,
                     azimuth_rad,
-                    ATM.signal_frequency_hz,
+                    signal_frequency_hz,
                     context["iono_model"].getParameters(date),
                 )
             if context["tropo_model"] is not None:
@@ -315,6 +351,7 @@ def build_observation_atmosphere(
         "tropo_delay_m": tropo_delay_m,
         "total_delay_m": total_delay_m,
         "total_delay_rate_mps": finite_difference(total_delay_m, t_sec),
+        "signal_frequency_hz": np.array(signal_frequency_hz, dtype=float),
         "klobuchar_alpha": context["klobuchar_alpha"] if ATM.enable_klobuchar or ATM.enable_hopfield else np.asarray(ATM.klobuchar_alpha, dtype=float),
         "klobuchar_beta": context["klobuchar_beta"] if ATM.enable_klobuchar or ATM.enable_hopfield else np.asarray(ATM.klobuchar_beta, dtype=float),
         "klobuchar_source": np.array(
@@ -335,12 +372,35 @@ def summarize_observation_atmosphere(obs_atmosphere: dict[str, np.ndarray]) -> d
     }
 
 
-def load_pass_record(index_file: Path, satellite_name: str, pass_index: int) -> dict[str, Any]:
+def load_pass_index(index_file: Path) -> dict[str, Any]:
     if not index_file.exists():
         raise FileNotFoundError(
             f"Step 1 summary file not found: {index_file}. Run step1_data_generation/generate_pass_data.py first."
         )
-    summary = json.loads(index_file.read_text(encoding="utf-8"))
+    return json.loads(index_file.read_text(encoding="utf-8"))
+
+
+def list_available_passes(index_file: Path) -> None:
+    summary = load_pass_index(index_file)
+    passes = summary.get("passes", [])
+    if not passes:
+        print("No passes found in passes_index.json")
+        return
+
+    print("Available passes:")
+    for record in passes:
+        frequency_mhz = resolve_signal_frequency_hz(record["satellite_name"]) / 1.0e6
+        print(
+            f"  satellite = {record['satellite_name']:<24} | "
+            f"pass = {int(record['pass_index']):02d} | "
+            f"duration = {float(record['duration_sec']):7.1f} s | "
+            f"start = {record['pass_start_utc']} | "
+            f"freq = {frequency_mhz:.3f} MHz"
+        )
+
+
+def load_pass_record(index_file: Path, satellite_name: str, pass_index: int) -> dict[str, Any]:
+    summary = load_pass_index(index_file)
     matches = [
         record
         for record in summary.get("passes", [])
@@ -350,7 +410,7 @@ def load_pass_record(index_file: Path, satellite_name: str, pass_index: int) -> 
         available = [f"{record['satellite_name']}#pass{record['pass_index']}" for record in summary.get("passes", [])]
         raise ValueError(
             f"Requested pass not found for satellite '{satellite_name}' and pass index {pass_index}. "
-            f"Available passes: {available}"
+            f"Available passes: {available}. Use --list-passes to inspect the current step1 catalog."
         )
     return matches[0]
 
@@ -743,6 +803,43 @@ def symmetric_plot_limit(*arrays: np.ndarray, padding: float = 0.15, minimum_hal
     return max(max_abs * (1.0 + padding), minimum_half_span)
 
 
+def zoom_window_limits(
+    east_north_samples_m: np.ndarray,
+    ellipse_m: np.ndarray,
+    padding: float = 0.35,
+    minimum_span_m: float = 2.0,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    cloud = np.vstack((east_north_samples_m, ellipse_m.T))
+    xmin, ymin = np.min(cloud, axis=0)
+    xmax, ymax = np.max(cloud, axis=0)
+    x_center = 0.5 * (xmin + xmax)
+    y_center = 0.5 * (ymin + ymax)
+    x_half = max(0.5 * (xmax - xmin) * (1.0 + padding), 0.5 * minimum_span_m)
+    y_half = max(0.5 * (ymax - ymin) * (1.0 + padding), 0.5 * minimum_span_m)
+    return (x_center - x_half, x_center + x_half), (y_center - y_half, y_center + y_half)
+
+
+def add_zoom_inset(
+    axis: Any,
+    east_north_samples_m: np.ndarray,
+    ellipse_m: np.ndarray,
+    mean_en_m: np.ndarray,
+    title: str,
+) -> None:
+    xlim, ylim = zoom_window_limits(east_north_samples_m, ellipse_m)
+    inset = axis.inset_axes([0.57, 0.07, 0.38, 0.38])
+    inset.scatter(east_north_samples_m[:, 0], east_north_samples_m[:, 1], s=20, alpha=0.7, color="#1f77b4", linewidths=0.0)
+    inset.plot(ellipse_m[0], ellipse_m[1], color="#d62728", linewidth=1.8)
+    inset.scatter([mean_en_m[0]], [mean_en_m[1]], marker="x", s=75, color="#2ca02c", linewidths=1.6)
+    inset.set_xlim(*xlim)
+    inset.set_ylim(*ylim)
+    inset.set_aspect("equal", adjustable="box")
+    inset.set_title(title, fontsize=9, pad=2.0)
+    inset.grid(True, alpha=0.25)
+    inset.tick_params(labelsize=8)
+    axis.indicate_inset_zoom(inset, edgecolor="0.4", alpha=0.9)
+
+
 def save_monte_carlo_scatter_plot(
     figure_path: Path,
     result: dict[str, Any],
@@ -767,6 +864,7 @@ def save_monte_carlo_scatter_plot(
     axes[0].set_ylabel("North Error (m)")
     axes[0].legend(loc="best")
     axes[0].grid(True, alpha=0.3)
+    add_zoom_inset(axes[0], east_north, ellipse, mean_en, "Zoomed error cloud")
 
     axes[1].scatter(east_north[:, 0], east_north[:, 1], s=18, alpha=0.45, color="#1f77b4", linewidths=0.0)
     axes[1].plot(ellipse[0], ellipse[1], color="#d62728", linewidth=2.0, label="90% ellipse")
@@ -776,6 +874,7 @@ def save_monte_carlo_scatter_plot(
     axes[1].set_xlabel("East in Local Receiver Frame (m)")
     axes[1].legend(loc="best")
     axes[1].grid(True, alpha=0.3)
+    add_zoom_inset(axes[1], east_north, ellipse, mean_en, "Zoomed estimates")
 
     for axis in axes:
         axis.set_xlim(-limit, limit)
@@ -986,18 +1085,18 @@ def run_monte_carlo_case(
     }
 
 
-def json_summary(result: dict[str, Any], satellite_name: str, pass_index: int) -> dict[str, Any]:
+def json_summary(result: dict[str, Any], satellite_name: str, pass_index: int, selection: SelectionConfig) -> dict[str, Any]:
     obs_atmosphere_summary = summarize_observation_atmosphere(result["obs_atmosphere"])
     summary = {
         "satellite_name": satellite_name,
         "pass_index": pass_index,
-        "orbit_source": SELECTION.orbit_source,
+        "orbit_source": selection.orbit_source,
         "mode": result["mode"],
         "noise_profile": result["obs_cfg"]["noise_profile"],
         "atmosphere": {
             "enable_klobuchar": ATM.enable_klobuchar,
             "enable_hopfield": ATM.enable_hopfield,
-            "signal_frequency_hz": ATM.signal_frequency_hz,
+            "signal_frequency_hz": scalar_number(result["obs_atmosphere"]["signal_frequency_hz"]),
             "klobuchar_nav_file": ATM.klobuchar_nav_file,
             "klobuchar_source": scalar_string(result["obs_atmosphere"]["klobuchar_source"]),
             "klobuchar_alpha": np.asarray(result["obs_atmosphere"]["klobuchar_alpha"], dtype=float).tolist(),
@@ -1042,13 +1141,13 @@ def json_summary(result: dict[str, Any], satellite_name: str, pass_index: int) -
     return summary
 
 
-def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: int) -> None:
+def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: int, selection: SelectionConfig) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     profile_tag = sanitize_tag(str(result["obs_cfg"]["noise_profile"]))
     satellite_tag = sanitize_tag(satellite_name)
     stem = f"{satellite_tag}_pass_{pass_index:02d}_{profile_tag}_{result['mode']}"
     summary_path = OUTPUT_DIR / f"{stem}.json"
-    summary_path.write_text(json.dumps(json_summary(result, satellite_name, pass_index), indent=2), encoding="utf-8")
+    summary_path.write_text(json.dumps(json_summary(result, satellite_name, pass_index, selection), indent=2), encoding="utf-8")
 
     if result["mode"] == "single_trial":
         raw_arrays = {
@@ -1057,6 +1156,7 @@ def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: i
             "post_sigma": result["post_sigma"],
             "azimuth_deg": result["obs_atmosphere"]["azimuth_deg"],
             "elevation_deg": result["obs_atmosphere"]["elevation_deg"],
+            "signal_frequency_hz": result["obs_atmosphere"]["signal_frequency_hz"],
             "klobuchar_alpha": result["obs_atmosphere"]["klobuchar_alpha"],
             "klobuchar_beta": result["obs_atmosphere"]["klobuchar_beta"],
             "iono_delay_m": result["obs_atmosphere"]["iono_delay_m"],
@@ -1079,6 +1179,7 @@ def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: i
             "iter_last_all": result["iter_last_all"],
             "azimuth_deg": result["obs_atmosphere"]["azimuth_deg"],
             "elevation_deg": result["obs_atmosphere"]["elevation_deg"],
+            "signal_frequency_hz": result["obs_atmosphere"]["signal_frequency_hz"],
             "klobuchar_alpha": result["obs_atmosphere"]["klobuchar_alpha"],
             "klobuchar_beta": result["obs_atmosphere"]["klobuchar_beta"],
             "iono_delay_m": result["obs_atmosphere"]["iono_delay_m"],
@@ -1100,8 +1201,18 @@ def save_result_files(result: dict[str, Any], satellite_name: str, pass_index: i
 
 def main() -> int:
     try:
-        pass_record = load_pass_record(STEP1_INDEX_FILE, SELECTION.satellite_name, SELECTION.pass_index)
-        pass_data = load_step1_pass(Path(pass_record["file"]), SELECTION.orbit_source)
+        args = parse_cli_args()
+        if args.list_passes:
+            list_available_passes(STEP1_INDEX_FILE)
+            return 0
+
+        selection = SelectionConfig(
+            satellite_name=args.satellite_name,
+            pass_index=int(args.pass_index),
+            orbit_source=args.orbit_source.upper(),
+        )
+        pass_record = load_pass_record(STEP1_INDEX_FILE, selection.satellite_name, selection.pass_index)
+        pass_data = load_step1_pass(Path(pass_record["file"]), selection.orbit_source)
 
         receiver_cfg = ReceiverConfig(
             latitude_deg=float(pass_data["receiver_lla_deg_m"][0]),
@@ -1119,11 +1230,13 @@ def main() -> int:
         obs_start_utc = obs_start_dt.isoformat()
         rho_geom, _ = rho_jac_ecef(rr_true, rs)
         rd_geom, _ = rhodot_jac_ecef(rr_true, rs, vs)
-        obs_atmosphere = build_observation_atmosphere(receiver_cfg, obs_start_utc, t_sec, rs)
+        signal_frequency_hz = resolve_signal_frequency_hz(pass_data["satellite_name"])
+        obs_atmosphere = build_observation_atmosphere(receiver_cfg, obs_start_utc, t_sec, rs, signal_frequency_hz)
         obs_atmosphere_summary = summarize_observation_atmosphere(obs_atmosphere)
 
         print(f"Selected satellite: {pass_data['satellite_name']} | pass {pass_data['pass_index']:02d}")
-        print(f"Orbit source for synthetic observations: {SELECTION.orbit_source}")
+        print(f"Orbit source for synthetic observations: {selection.orbit_source}")
+        print(f"Signal frequency: {signal_frequency_hz / 1.0e6:.3f} MHz")
         print(f"Receiver LLA [deg, deg, m]: [{lat_deg:.6f}, {lon_deg:.6f}, {h_true:.3f}]")
         print(f"Number of epochs used: {t_sec.size}")
         print(f"Pass interval: {pass_data['pass_start_utc']} -> {pass_data['pass_end_utc']}")
@@ -1196,13 +1309,13 @@ def main() -> int:
 
             results.append(result)
             if RUN.save_results:
-                save_result_files(result, pass_data["satellite_name"], pass_data["pass_index"])
+                save_result_files(result, pass_data["satellite_name"], pass_data["pass_index"], selection)
 
         if RUN.save_results:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             sweep_summary = {
                 "receiver": asdict(receiver_cfg),
-                "selection": asdict(SELECTION),
+                "selection": asdict(selection),
                 "data": asdict(DATA),
                 "truth": asdict(TRUTH),
                 "init": asdict(INIT),
@@ -1210,7 +1323,10 @@ def main() -> int:
                 "monte_carlo": asdict(MC),
                 "atmosphere": asdict(ATM),
                 "run": asdict(RUN),
-                "profiles": [json_summary(result, pass_data["satellite_name"], pass_data["pass_index"]) for result in results],
+                "profiles": [
+                    json_summary(result, pass_data["satellite_name"], pass_data["pass_index"], selection)
+                    for result in results
+                ],
             }
             summary_file = OUTPUT_DIR / f"{sanitize_tag(pass_data['satellite_name'])}_pass_{pass_data['pass_index']:02d}_summary.json"
             summary_file.write_text(json.dumps(sweep_summary, indent=2), encoding="utf-8")
